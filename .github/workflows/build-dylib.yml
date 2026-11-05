@@ -1,0 +1,460 @@
+name: build-dylib
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      ipa_url:
+        description: 'Direct download URL of the decrypted GoodNotes .ipa. Leave empty to skip the ipa job.'
+        required: false
+        default: ''
+      ipa_sha256:
+        description: 'Optional expected SHA-256 of that file. The job fails if it does not match.'
+        required: false
+        default: ''
+      signed_ipa_url:
+        description: 'Direct download URL of the IPA *after* LC Sign. Runs inspect and fails while the four keys are still in the signature.'
+        required: false
+        default: ''
+
+jobs:
+  # Cheap checks that do not need an iOS SDK. They catch the two mistakes that
+  # actually happen: a plist that no longer parses, and a config that would let
+  # a Distribution-signed build write to a code page.
+  lint:
+    name: config + scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate the plist
+        run: |
+          # The shipped defaults live in scripts/plist_expect.py and nowhere
+          # else. They used to be restated here as well, and v23 failed in this
+          # job before a line compiled: the lint had been taught that
+          # ThrowSwallowAtSite ships true, the copy in this file still demanded
+          # false, and both were right about their own version.
+          #
+          # --selftest mutates the config once per expectation and requires the
+          # check to reject it, so this step can fail rather than merely pass.
+          python3 scripts/plist_expect.py config/GNUnlock.plist
+          python3 scripts/plist_expect.py config/GNUnlock.plist --selftest
+
+      - name: Byte compile the scripts
+        run: python3 -m py_compile scripts/bake_plist.py scripts/gnstatic.py scripts/plist_expect.py scripts/rebind_lint.py scripts/rebind_decoder_test.py scripts/v11_lint.py scripts/v12_lint.py tools/ipa_icloud_strip.py
+
+      - name: The IPA rewriter, executed on the host
+        run: |
+          # This is the only tool here that writes a file the user then installs,
+          # so it is tested the same way everything else is: by running it.
+          #
+          # --selftest builds synthetic archives and asserts the properties a
+          # re-signer actually cares about - member order, mode bits, symlink
+          # flags, CRC-32 of every untouched member, a byte-identical main
+          # executable - and then asserts that the failure modes fail: an
+          # unparseable .xcent and a truncated zip must both exit non-zero and
+          # leave no output file behind. A tool that produces a broken IPA when
+          # it does not understand the input is worse than one that refuses.
+          python3 tools/ipa_icloud_strip.py --selftest
+
+      - name: Offline patcher self test
+        run: python3 scripts/gnstatic.py selftest
+
+      - name: v11 invariants, and a mutation test that they can fail
+        run: |
+          python3 scripts/v11_lint.py
+          python3 scripts/v11_lint.py --selftest
+          # The experiment ladder's state machine is pure C - execute it.
+          cc -std=c11 scripts/experiment_ladder_test.c -o /tmp/experiment_ladder_test
+          /tmp/experiment_ladder_test
+
+      - name: The import slot walker, executed on the host
+        run: |
+          # src/GNSlotWalk.h is deliberately free of Apple headers and of
+          # Foundation, so this is a test that runs its subject instead of
+          # compiling it: synthetic Mach-O images placed at the end of a mapped
+          # page with a PROT_NONE guard behind them, a lying nsects, a lying
+          # cmdsize, a truncated sizeofcmds, the refusal path - and then the same
+          # walk against a real Mach-O object produced by this job's compiler, so
+          # the structure offsets are checked against real output.
+          #
+          # That object's section count is whatever this clang emits - two on a
+          # plain Apple object, a dozen when it carries debug info, one with
+          # -fno-unwind-tables. The test therefore compares the walker's counts
+          # with the counts in the file itself, never with a number in the test:
+          # v16 asserted ">= 5", which was true of the machine it was written on
+          # and false here, and it failed a walker that was correct.
+          cc -std=c11 -Wno-unknown-pragmas scripts/slotwalk_test.c -o /tmp/slotwalk_test
+          /tmp/slotwalk_test
+          printf 'extern int gn_a(int);\nextern int gn_b(int);\nint gn_f(int x){return gn_a(x)+gn_b(x);}\n' > /tmp/gn_slot_fixture.c
+          clang -target arm64-apple-ios14.0 -c /tmp/gn_slot_fixture.c -o /tmp/gn_slot_fixture.o
+          /tmp/slotwalk_test /tmp/gn_slot_fixture.o
+
+      - name: The entitlement repair's shape, executed on the host
+        run: |
+          # v17 shipped a repair that answered a rule wanting an array of strings
+          # with a bare string. Nothing caught it: the decision lived inside
+          # CoreFoundation code, where no host test can execute it, and the device
+          # log said "interception is LIVE" because the mechanism really was live.
+          #
+          # The decision is now pure C (src/GNRepairPolicy.h), so this runs it:
+          # 2 x 4 x 2 x 2 x 3 x 2 combinations, asserting that a repair either
+          # changes nothing or produces exactly the kind the schema requires.
+          # --selfcheck then runs the same assertions against v17's own decision
+          # and requires them to fail, so the test cannot pass by being vacuous.
+          cc -std=c11 -Wall -Wextra -Werror -O1 scripts/repair_policy_test.c -o /tmp/repair_policy_test
+          /tmp/repair_policy_test
+          /tmp/repair_policy_test --selfcheck
+
+      - name: The v25 function-start walker, executed on the host
+        run: |
+          # v25 turns the interior offset a crash log prints ("CKPersona.launch
+          # + 592") into the entry address of the function containing it, by
+          # walking the image's LC_FUNCTION_STARTS delta list. Off by one entry
+          # and the dylib points an import slot at the wrong function - so the
+          # arithmetic is a header with no Apple dependencies, and this runs it:
+          # multi-byte deltas, a truncated encoding, an overlong one, an
+          # overflowing delta, an address below __TEXT, and the "exact hit before
+          # the truncation" case. --selfcheck then runs the same expectations
+          # against v24's reading (interior offset == entry) and requires them to
+          # fail, so the test cannot pass by checking nothing.
+          cc -std=c11 -Wall -Wextra -Werror -O1 scripts/functionstarts_test.c -o /tmp/functionstarts_test
+          /tmp/functionstarts_test
+          /tmp/functionstarts_test --selfcheck
+
+      - name: v12 invariants, and a mutation test that they can fail
+        run: |
+          # This is the only place structural rules live. The launch-guard-before-
+          # run-level check used to be a `grep -n` + line-number comparison right
+          # here in this file, pointing at src/GNUnlock.m; v12 moved the guard and
+          # the gate into src/GNLegacy.m and the check failed the build before a
+          # single line compiled. It is now the legacy-guard-first rule in
+          # scripts/v12_lint.py, mutation tested like everything else, and a step
+          # that greps source by line number is itself a lint failure.
+          python3 scripts/v12_lint.py
+          python3 scripts/v12_lint.py --selftest
+
+      - name: No executable-memory writes unless gated
+        run: |
+          # Every write path has to go through GNWriteBytes / GNPatchCodeBytes,
+          # which ask GNCodePatchingAllowed() first. A raw vm_protect with both
+          # WRITE and EXECUTE in it is the thing that kills the app outright.
+          if grep -rnE 'VM_PROT_WRITE *\| *VM_PROT_EXECUTE' src/; then
+            echo "error: W^X violating vm_protect request" >&2
+            exit 1
+          fi
+          echo "ok: no W^X violating request"
+
+      - name: No ptrauth builtin with a run time discriminator
+        run: |
+          # A chained-fixup discriminator is read at run time; the ptrauth
+          # builtins that take one only accept an integer constant expression,
+          # which is a hard front-end error on arm64e. Signing goes through
+          # GNSignPointer() in src/GNRebind.m, which emits the instruction.
+          # Comment lines are skipped: the header of GNRebind.m names the
+          # builtin while explaining why it cannot be used.
+          hits="$(grep -rnE 'ptrauth_(sign_unauthenticated|sign_constant|auth_and_resign)[[:space:]]*\(' src/ \
+                  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)' || true)"
+          if [ -n "$hits" ]; then
+            echo "error: ptrauth builtin with a run time discriminator:" >&2
+            echo "$hits" >&2
+            exit 1
+          fi
+          echo "ok: pointer signing is done in GNSignPointer()"
+
+      - name: The arm64e signer is still there
+        run: |
+          grep -q 'pacia %0, x9' src/GNRebind.m \
+            || { echo "error: GNSignPointer lost its pac sequence" >&2; exit 1; }
+          # plain substring on purpose: '(' is a group in some grep dialects
+          grep -q '__arm64e__' src/GNRebind.m \
+            || { echo "error: the arm64e guard is missing" >&2; exit 1; }
+          grep -q 'GN_RUNTIME_PTRAUTH' src/GNRebind.m \
+            || { echo "error: GN_RUNTIME_PTRAUTH guard is missing" >&2; exit 1; }
+          echo "ok: runtime PAC signer present and guarded"
+
+      - name: No init-family selector is swizzled
+        run: |
+          # Swizzling an init-family selector (alloc / init / new / copy) with a
+          # plain C function breaks ARC's ownership contract: the caller consumes
+          # a +1 object, the function hands back +0. v7 did this to
+          # -[NSUserDefaults initWithSuiteName:] and also re-called init on a
+          # `self` the previous init was allowed to have released.
+          hits="$(grep -rnE 'GNHook(Instance|Class|IfExists)\([^;]*"[^"]*init' src/ \
+                  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)' || true)"
+          if [ -n "$hits" ]; then
+            echo "error: an init-family selector is swizzled with a C function:" >&2
+            echo "$hits" >&2
+            exit 1
+          fi
+          echo "ok: no init-family selector is swizzled"
+
+      - name: GNGuard cannot recurse into its own abort tracer
+        run: |
+          # GNGuard rebinds abort()/exit() in every app owned image - and this
+          # dylib is app owned, so its own import slots are rebound too. A direct
+          # call to either inside GNGuard.m would be traced, re-enter the tracer,
+          # and be traced again. grep cannot tell a comment from a string from
+          # code here, so this strips both first, and it does it in Python rather
+          # than in a grep -v chain that would silently stop matching.
+          python3 - src/GNGuard.m <<'PYGUARD'
+          import re, sys
+
+          path = sys.argv[1]
+          bad = []
+          with open(path, "r", encoding="utf-8") as handle:
+              for number, line in enumerate(handle, 1):
+                  code = line.split("//", 1)[0]
+                  if code.lstrip().startswith("*"):
+                      code = ""
+                  code = re.sub(r'@?"(?:[^"\\]|\\.)*"', '""', code)
+                  for match in re.finditer(r'(?<![_A-Za-z0-9.>])(abort|exit)\s*\(', code):
+                      bad.append((number, line.rstrip()))
+
+          if bad:
+              sys.stderr.write("error: GNGuard.m calls abort()/exit() directly - those\n"
+                               "       slots are rebound by GNGuard itself.\n"
+                               "       Call gRealAbort()/gRealExit(), or _exit().\n")
+              for number, line in bad:
+                  sys.stderr.write("  %s:%d: %s\n" % (path, number, line))
+              sys.exit(1)
+          PYGUARD
+
+      - name: No bare Apple dyld struct tag
+        run: |
+          # Apple's dyld types are bare struct tags - `struct dyld_...` and no
+          # typedef - so naming one without `struct` is a hard front end error.
+          # It only shows up with an iOS SDK on the include path, which is how
+          # v5 shipped a file that failed on line 216. The tag may appear in a
+          # declaration and nowhere else: call sites name GNAuthBindPtr.
+          hits="$(grep -rnE 'dyld_(chained|fixups)_[a-z0-9_]+[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*[;=]' src/ \
+                  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)' \
+                  | grep -vE 'struct[[:space:]]+dyld_' || true)"
+          if [ -n "$hits" ]; then
+            echo "error: Apple dyld struct type named without 'struct':" >&2
+            echo "$hits" >&2
+            exit 1
+          fi
+          echo "ok: Apple dyld types are only named through the typedef"
+
+      - name: Memory queries go through vm_region_64, never mach_vm_*
+        run: |
+          # <mach/mach_vm.h> on iOS is one line: "#error mach_vm.h unsupported."
+          # One #import of it aborts the translation unit, and every mach_vm_*
+          # call underneath is then undeclared as well - one include, two
+          # errors. v5 and v6 both died on exactly this, in the same file, and
+          # both times it was only found by compiling. It is a lint now.
+          hits="$(grep -rnE 'mach_vm_[a-z_0-9]|mach/mach_vm\.h' src/ \
+                  | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|\*|/\*)' || true)"
+          if [ -n "$hits" ]; then
+            echo "error: mach_vm_* is not usable on iOS (mach_vm.h is '#error'):" >&2
+            echo "$hits" >&2
+            echo "       use vm_region_64 / vm_protect from <mach/vm_map.h>" >&2
+            exit 1
+          fi
+          grep -q '#import <mach/vm_map.h>' src/GNSupport.m \
+            || { echo "error: GNSupport.m no longer imports <mach/vm_map.h>" >&2; exit 1; }
+          grep -q 'dlsym(RTLD_DEFAULT, "vm_region_64")' src/GNSupport.m \
+            || { echo "error: the run time vm_region_64 lookup is gone" >&2; exit 1; }
+          echo "ok: vm_region_64 via dlsym, no mach_vm_* anywhere"
+
+      - name: The auth bind decode is still the published one
+        run: |
+          grep -q 'typedef struct dyld_chained_ptr_arm64e_auth_bind GNAuthBindPtr;' src/GNRebind.m \
+            || { echo "error: the Apple typedef is gone" >&2; exit 1; }
+          grep -q 'GNAuthBindPtr decoded;' src/GNRebind.m \
+            || { echo "error: the auth bind is not decoded through the typedef" >&2; exit 1; }
+          grep -q 'GNAuthBindPtrIsOneWord' src/GNRebind.m \
+            || { echo "error: the one-word size guard is gone" >&2; exit 1; }
+          # The fallback mirror is transcribed from <mach-o/fixup-chains.h>:
+          # ordinal:16 zero:16 diversity:16 addrDiv:1 key:2 next:11 bind:1 auth:1.
+          # The `zero` field is 16 bits, not 8 - v5 had it at 8 and shifted the
+          # whole auth layout by 8 bits as a result.
+          grep -qE 'uint64_t zero[[:space:]]*:[[:space:]]*16;' src/GNRebind.m \
+            || { echo "error: the mirror's zero field is not 16 bits" >&2; exit 1; }
+          # Pointer format numbers have to match dyld's enum: 9 userland, 10 firmware.
+          grep -qE 'define GN_PTR_ARM64E_USERLAND[[:space:]]+9' src/GNRebind.m \
+            || { echo "error: ARM64E_USERLAND is not 9" >&2; exit 1; }
+          grep -qE 'define GN_PTR_ARM64E_FIRMWARE[[:space:]]+10' src/GNRebind.m \
+            || { echo "error: ARM64E_FIRMWARE is not 10" >&2; exit 1; }
+          # Last resort: the v5 shift that decoded every auth slot 8 bits off.
+          if grep -qE 'raw >> 43' src/GNRebind.m; then
+            echo "error: the v5 next-at-43 shift is back" >&2
+            exit 1
+          fi
+          echo "ok: auth bind layout and pointer format numbers pinned"
+
+  build:
+    name: GNUnlock.dylib
+    needs: lint
+    runs-on: macos-14
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain
+        run: |
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          clang --version | head -n 1
+
+      - name: Build
+        run: bash scripts/build.sh
+
+      - name: Upload dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: GNUnlock-dylib
+          path: out/GNUnlock.dylib
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload the baked config (for the record)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: GNUnlock-baked-config
+          path: build/GNBakedConfig.h
+          if-no-files-found: warn
+          retention-days: 7
+  # ---------------------------------------------------------------------------
+  # The IPA side.
+  #
+  # Everything above this line is about a dylib that argues with CloudKit at run
+  # time.  v27 ended that argument: the call from CKPersona.launch into
+  # objc_exception_throw is a direct branch inside the dyld shared cache, the
+  # slot walker found 0 slots holding it, so the trampoline was never entered
+  # and the FORCED SWALLOW line never printed.  No data-only mechanism can reach
+  # it.  The remaining lever is the entitlements in the signature, and that is
+  # decided before the app ever runs.
+  #
+  # Two jobs, because there are two different questions:
+  #
+  #   ipa           the IPA as it arrives: remove the four keys from every .xcent
+  #                 in the bundle, and emit a signing template.
+  #   verify-signed the IPA as LC Sign returned it: read the entitlements out of
+  #                 the code signature and fail while the four keys are present.
+  #
+  # The second one is the important one.  `archived-expanded-entitlements.xcent`
+  # is a build artefact the archiver leaves in the bundle; it is not what the
+  # kernel reads.  CloudKit reads the entitlements blob in the main binary's
+  # LC_CODE_SIGNATURE.  Stripping the bundle therefore only helps if the signer
+  # imports bundle entitlements - and verify-signed is how that stops being a
+  # guess, in one line of log, without an iPad.
+  # ---------------------------------------------------------------------------
+
+  ipa:
+    name: IPA without the four iCloud entitlements
+    needs: lint
+    if: github.event_name == 'workflow_dispatch' && inputs.ipa_url != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the IPA
+        env:
+          IPA_URL: ${{ inputs.ipa_url }}
+          IPA_SHA256: ${{ inputs.ipa_sha256 }}
+        run: |
+          set -euo pipefail
+          # --retry-all-errors matters here: a 600 MB fetch from a file host
+          # fails with a stale connection far more often than with a 404, and
+          # curl does not retry those unless asked.
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+               -o "$RUNNER_TEMP/in.ipa" "$IPA_URL"
+          ls -l "$RUNNER_TEMP/in.ipa"
+          if [ -n "${IPA_SHA256:-}" ]; then
+            echo "$IPA_SHA256  $RUNNER_TEMP/in.ipa" | sha256sum -c -
+          else
+            echo "no sha256 supplied; recording it instead"
+            sha256sum "$RUNNER_TEMP/in.ipa"
+          fi
+
+      - name: Record what the signature declares before anything is touched
+        run: |
+          # Not a gate: a fresh App Store IPA legitimately carries all four keys,
+          # and failing here would fail every honest run. This is the baseline
+          # the post-signing check is compared against.
+          python3 tools/ipa_icloud_strip.py inspect "$RUNNER_TEMP/in.ipa" \
+            --report "$RUNNER_TEMP/inspect-before.json" || true
+
+      - name: Strip the four keys and repack
+        run: |
+          python3 tools/ipa_icloud_strip.py strip "$RUNNER_TEMP/in.ipa" \
+            -o "$RUNNER_TEMP/Goodnotes-NoiCloud.ipa" \
+            --report "$RUNNER_TEMP/strip-report.json" \
+            --entitlements-out "$RUNNER_TEMP/NoiCloud.entitlements"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: Goodnotes-NoiCloud
+          # One archive plus two small files. Actions artifacts are zipped again
+          # on the way out, so a 600 MB IPA costs a second compression - worth
+          # knowing before choosing retention, not worth avoiding.
+          path: |
+            ${{ runner.temp }}/Goodnotes-NoiCloud.ipa
+            ${{ runner.temp }}/NoiCloud.entitlements
+            ${{ runner.temp }}/strip-report.json
+            ${{ runner.temp }}/inspect-before.json
+          if-no-files-found: error
+          retention-days: 14
+
+  verify-signed:
+    name: Does the signature still declare iCloud?
+    needs: lint
+    if: github.event_name == 'workflow_dispatch' && inputs.signed_ipa_url != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download the signed IPA
+        env:
+          IPA_URL: ${{ inputs.signed_ipa_url }}
+        run: |
+          set -euo pipefail
+          curl -fL --retry 5 --retry-delay 3 --retry-all-errors \
+               -o "$RUNNER_TEMP/signed.ipa" "$IPA_URL"
+          ls -l "$RUNNER_TEMP/signed.ipa"
+
+      - name: Inspect the entitlements CloudKit will actually read
+        id: inspect
+        run: |
+          set +e
+          python3 tools/ipa_icloud_strip.py inspect "$RUNNER_TEMP/signed.ipa" \
+            --report "$RUNNER_TEMP/inspect-after.json"
+          status=$?
+          set -e
+          echo "status=$status" >> "$GITHUB_OUTPUT"
+          case "$status" in
+            0)
+              echo "::notice::clean - the signature declares none of the four keys. This is the state that cannot throw a malformed-entitlement CKException."
+              ;;
+            1)
+              echo "::error::the four keys are still in the signature. The bundle's .xcent was not what CloudKit reads, so the signer is supplying them itself. Sign again with NoiCloud.entitlements, or with a profile that grants no iCloud container."
+              ;;
+            *)
+              echo "::error::inspect could not read this IPA (exit $status). Check that the upload is the signed .ipa and not a zip of it."
+              ;;
+          esac
+          exit "$status"
+
+      - name: Keep the report even when the gate fails
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: signature-inspection
+          path: ${{ runner.temp }}/inspect-after.json
+          if-no-files-found: warn
+          retention-days: 14
