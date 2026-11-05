@@ -1,0 +1,21 @@
+{
+  "_comment": [
+    "Offline patch file for scripts/gnstatic.py patch.",
+    "Each entry needs: image (executable name or a dylib under Frameworks),",
+    "either vmaddr (absolute, e.g. 0x1002331b60) or offset (relative to the",
+    "__TEXT base, e.g. 0x2331b60 - the number the runtime anchor log prints as",
+    "'(static 0x...)'), expect (bytes that must already be there), bytes (what",
+    "to write).",
+    "20008052c0035fd6 is 'mov w0, #1 ; ret'. The expect check is what keeps a",
+    "stale offset from writing into the middle of a 260 MB binary."
+  ],
+  "patches": [
+    {
+      "name": "entitlement-getter-returns-true",
+      "image": "Goodnotes",
+      "offset": "0x231f1fc",
+      "expect": "fd 7b bf a9",
+      "bytes": "20008052c0035fd6"
+    }
+  ]
+}

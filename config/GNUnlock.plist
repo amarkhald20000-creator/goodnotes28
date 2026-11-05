@@ -1,0 +1,1185 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  =====================================================================
+	  GNUnlock configuration - v3 (distribution certificate edition)
+	  =====================================================================
+
+	  What changed from v2, and why:
+
+	    * Every BytePatch / Anchor that rewrote executable memory is gone.
+	      On a Distribution signature those writes do not fail gracefully:
+	      the page becomes an anonymous copy, loses its code signature, and
+	      the first instruction fetched from it kills the process with
+	      "CODESIGNING / Invalid Page". This applies to the app's own __text
+	      as well as to system frameworks.
+
+	    * The anchor that targeted SecTaskCreateFromSelf is gone too. It was
+	      writing into the dyld shared cache, and it took the whole
+	      Security.framework page down with it - which is exactly the crash
+	      you were debugging.
+
+	    * The C level re-sign fixes (SecItem*, SecStaticCode*, SecTask*) no
+	      longer inline hook. They go through GNInterposeSymbol(), which on a
+	      Distribution build refuses to write code and either rebinds the
+	      app's own import slots (data pages, safe) or skips and logs.
+
+	    * Unlocking is done with data instead: preference overrides, the
+	      SyncedDefaults identifier, and forged HTTP responses. Plus, when a
+	      Swift vtable slot really has to be changed, an offline patch of the
+	      Mach-O before signing (scripts/gnstatic.py) - the only form of code
+	      patch a Distribution certificate tolerates.
+
+	  Boot order remains: constructor -> re-sign hooks + data hooks ->
+	  delayed patch pipeline (Delay seconds later).
+	-->
+
+	<key>ConfigVersion</key>
+	<integer>27</integer>
+
+	<key>Enabled</key>
+	<true/>
+
+	<!-- ======================= v12 default posture =======================
+
+	     v12 ships inert on purpose. The constructor opens the log, reads this
+	     process' own entitlements and container answers, and installs one
+	     read-only exception capture. It installs no hook, overrides no
+	     container, rebinds no import slot and writes no preference, so the app
+	     behaves exactly as it does with no dylib at all.
+
+	     That is the point. A build that changes nothing turns the next launch
+	     into an experiment with one variable: if it still crashes, the cause is
+	     the re-sign or the app, and no hook of ours can be blamed. -->
+
+	<!-- true  = observe only (default). Log + probe + name the exception.
+	     false = legacy full mode: launch guard, run levels, container
+	             fallbacks, keychain interposition, patch pipeline.
+	     Nothing in the legacy path is reached while this is true. -->
+	<key>ObserveOnly</key>
+	<true/>
+
+	<!-- Read and log the entitlements this process was actually signed with,
+	     and what each app group lookup really returns. This is the only
+	     non-guess answer to "did the app group entitlement survive LC Sign".
+	     Read only. -->
+	<key>ProbeSignedState</key>
+	<true/>
+
+	<!-- Hook -[NSException initWithName:reason:userInfo:] so the next launch
+	     crash arrives with a name and a reason instead of bare offsets.
+	     Records at most three exceptions, then removes itself. This is the only
+	     capture that sits on the path every Objective-C exception must take:
+	     NSSetUncaughtExceptionHandler is not called on the failed_throw path,
+	     and the v10/v11 @try nets were not in the crashing call chain. -->
+	<key>ExcForensics</key>
+	<true/>
+
+	<!-- ===================== v14: CloudKit entitlement guard =====================
+
+	     v13's log named the launch crash exactly:
+
+	         probe: com.apple.developer.icloud-services = *
+	         EXCEPTION name=CKException
+	                   reason=Application has malformed entitlements. Found value "*"
+	                          for entitlement com.apple.developer.icloud-services,
+	                          expected an array of strings
+
+	     Nothing in this dylib caused that: the signer wrote a string where
+	     CloudKit requires an array of strings. The real fix is in the signer
+	     (see README, "The iCloud entitlement crash"). This block is what keeps
+	     the launch alive until that is fixed, and it is separate from every hook
+	     switch below because it has to run in observe mode too.
+
+	     It is a suppressor, not a bypass of anything: the exception is still
+	     created, logged by ExcForensics, counted here, and then the raise
+	     returns instead of unwinding. -->
+	<!-- ==================== v21: the layer under the layer ====================
+
+	     v20 replaced fourteen Objective-C entry points on CKContainer and
+	     CKDatabase, and the device log showed one of them being reached:
+
+	         cloudkit-stub: -[GNStubCKDatabase addOperation:] -> ignored
+
+	     and the launch still died of the same CKException one step later. Those
+	     two facts together say the failed check is not at the API above the
+	     daemon conversation. It is underneath: either in an operation route that
+	     never passes through -[CKDatabase addOperation:], or in a check cloudd
+	     itself performs on this process's code signature.
+
+	     v21 answers both with three mechanisms that do not need to tell them
+	     apart, plus one hole closed:
+
+	       ThrowInterpose        reach every throw in the process, shared cache
+	                             included, through dyld's __DATA,__interpose table
+	                             rather than through import slots. This is what
+	                             v20's decoder always needed: it classified three
+	                             sites because it could only find three slots.
+	       XPCGate               point CloudKit's mach services at a name with
+	                             nothing behind it. libxpc then answers
+	                             XPC_ERROR_CONNECTION_INVALID, which is the answer
+	                             a caller already handles when a daemon is not
+	                             running. No reply is fabricated.
+	       CloudKitQuarantine    stop enumerating selectors and select on shape:
+	                             every void-returning work method on every class a
+	                             CloudKit image defines gets an empty body.
+	                             Return-value methods are untouched.
+	       (initialisers)        -[CKContainer initWithContainerIdentifier:] and
+	                             -initWithContainerID: are now replaced too. v20 left
+	                             them alone, which is the one route that reached a
+	                             real CKContainer. -->
+
+	<!-- ==================== v22: the connection this dylib can name ====================
+
+	     v21 interposed xpc_connection_create_mach_service as well, and that is what
+	     the runner rejected:
+
+	         error: 'xpc_connection_create_mach_service' is unavailable: not available on iOS
+	         error: conflicting types for 'xpc_connection_create_mach_service'
+
+	     Apple marks that function __attribute__((unavailable)) on this platform, so
+	     naming it - as a call, as an address, or as the second half of an interpose
+	     tuple - is a front end error before the link step. It is gone: declaration,
+	     replacement, table entry and dlsym name. There is no in-process way to
+	     interpose a function the SDK refuses to name, because an inline hook needs a
+	     code page and a Distribution signature forbids that.
+
+	     What remains is xpc_connection_create plus NSXPCConnection, and the launch log
+	     says so out loud: a CloudKit call that uses the mach-service variant
+	     specifically is not covered. That is a boundary, stated rather than implied.
+
+	     XPCGate is still the master switch, and off still means pass-through: the
+	     table is link time and cannot be removed at run time. -->
+	<key>ThrowInterpose</key>
+	<true/>
+
+	<key>XPCGate</key>
+	<true/>
+
+	<key>XPCGateNSXPC</key>
+	<true/>
+
+	<key>XPCGateLogBudget</key>
+	<integer>8</integer>
+
+	<!-- Which service names count as CloudKit. Narrow on purpose: a wider
+	     filter would redirect connections this dylib has no business touching,
+	     and a failure there would look like a bug in an unrelated framework. -->
+	<key>XPCGateServices</key>
+	<array>
+		<string>cloudd</string>
+		<string>cloudkit</string>
+		<string>com.apple.ck.</string>
+	</array>
+
+	<key>CloudKitQuarantine</key>
+	<true/>
+
+	<!-- neutralise  replace the body (default)
+	     assert      print what would be replaced and change nothing -->
+	<key>CloudKitQuarantineMode</key>
+	<string>neutralise</string>
+
+	<key>CloudKitQuarantineLogBudget</key>
+	<integer>12</integer>
+
+	<!-- v23: classes to answer by name, not by shape. The shape sweep above only
+	     looks at void-returning methods whose selector starts with a work prefix;
+	     a Swift class has neither. CKPersona is here because the v22 stack named
+	     it. Expect "0 ObjC-visible methods" in the log for a Swift-only class -
+	     that is the measurement that sends the job to
+	     GNCloudKitSymbolQuarantine.m, not a failure of this pass. -->
+	<key>CloudKitQuarantineClasses</key>
+	<array>
+		<string>CKPersona</string>
+	</array>
+
+	<!-- ==================== v25: the symbol surface, resolved at run time ====================
+
+	     v24 could not link. Its __DATA,__interpose table named
+
+	         $sSo9CKPersonaC8CloudKitE6launchABSgvgZ      (CKPersona.launch)
+	         CKMainBundleIsAppleExecutable
+
+	     and neither name is in CloudKit's .tbd, so weak_import changed nothing:
+	     the linker still had to recognise them and answered
+
+	         Undefined symbols for architecture arm64: ...
+
+	     v25 names nothing at link time. An entry's address comes from two sources,
+	     tried in this order, and the log says which one answered:
+
+	       1. dlsym - RTLD_DEFAULT, RTLD_NEXT, then a RTLD_NOLOAD handle on
+	          CloudKit. For a symbol that is not in the stub this answers NULL,
+	          which is the same fact as the link error, one stage later.
+	       2. CloudKitSymbolOffsets below. A crash log prints an interior offset
+	          ("CKPersona.launch + 592"), and the image carries its function entry
+	          points, unnamed, in LC_FUNCTION_STARTS. Walking that delta list turns
+	          the interior offset into the entry a caller would bind.
+
+	     The address is then handed to the v16 slot walker, which rewrites the
+	     import slots that hold it. Slots, not code pages: nothing here can trip
+	     the amfid check that killed v5.
+
+	     What it cannot do, stated once: a slot rewrite reaches *bindings*. CloudKit
+	     calling its own function inside its own image is a direct branch, and there
+	     is no slot. The log reports the slot count per entry, so a zero reads as
+	     "direct branch - the throw swallow is the remaining layer" instead of
+	     "installed". -->
+	<key>CloudKitSymbolQuarantine</key>
+	<true/>
+
+	<!-- Rewrite the slots that hold a resolved address. false = measure only:
+	     the probe still counts them, and nothing is written. -->
+	<key>CloudKitSymbolRebind</key>
+	<true/>
+
+	<!-- CKPersona.launch -> nil: "there is no persona", the answer a device with
+	     no iCloud account gives. -->
+	<key>CloudKitSymbolQuarantinePersonaLaunch</key>
+	<true/>
+
+	<!-- CKMainBundleIsAppleExecutable -> the bool below. Apple's own binaries do
+	     not go through the provisioning entitlement path, and this function is
+	     what decides which path CloudKit takes. -->
+	<key>CloudKitSymbolQuarantineMainBundleIsApple</key>
+	<true/>
+	<key>CloudKitSymbolQuarantineMainBundleAnswer</key>
+	<true/>
+	<key>CloudKitSymbolQuarantineLogBudget</key>
+	<integer>16</integer>
+
+	<!-- The image the offsets are relative to. A basename: GNImageIndexForName()
+	     matches it against what dyld reports. -->
+	<key>CloudKitSymbolImage</key>
+	<string>CloudKit</string>
+
+	<!-- label -> hex offset, relative to that image's load address.
+
+	     FILLED in v27, from the device crash report, not guessed:
+
+	         CrashReport-14C42871-1D82-4C0E-91DF-A9C2F2149AEE.json
+	         usedImages[CloudKit].image_addr   7278968832   0x1B1DC4000
+
+	         frame 13  CKPersona.launch                 7279034588   0x100DC
+	         frame 21  CKMainBundleIsAppleExecutable    7279271752   0x49F48
+
+	     Both are per OS build numbers: a system update moves them, and this
+	     table then has to be re-derived from the next .ips. They are interior
+	     values - what a crash log prints for a frame - so
+	     CloudKitSymbolOffsetKind stays "interior" and LC_FUNCTION_STARTS turns
+	     each into the entry a caller would bind.
+
+	     v27 also reads the same number as an entry when that walk cannot find
+	     one, so a wrong kind now costs a log line instead of a launch: the
+	     fallback line names which of the two readings was used.
+
+	     Written with or without 0x; the parser refuses anything that is not
+	     strictly hex, and refuses 0. -->
+	<key>CloudKitSymbolOffsets</key>
+	<dict>
+		<key>CKPersona.launch</key>
+		<string>0x100DC</string>
+		<key>CKMainBundleIsAppleExecutable</key>
+		<string>0x49F48</string>
+	</dict>
+
+	<!-- interior  the offset is the "+ 592" a crash log prints, and the entry is
+	              found through LC_FUNCTION_STARTS (default)
+	     entry     the offset already is the entry, relative to the image base -
+	              what an offline load-command dump gives -->
+	<key>CloudKitSymbolOffsetKind</key>
+	<string>interior</string>
+
+	<!-- Selector prefixes that count as "submits work". Only ever applied to
+	     methods that return void, so this list cannot make a caller receive a
+	     fabricated value. Empty means the built-in list in
+	     src/GNCloudKitQuarantine.m. -->
+	<key>CloudKitQuarantinePrefixes</key>
+	<array/>
+
+	<!-- ==================== v20: answer for CloudKit ====================
+
+	     v15 through v19 each made a measurement that came back LIVE - the
+	     singular SecTask read, the plural one, the dlsym that resolves them,
+	     the signing-information dictionary - and every one of them left the
+	     launch dying of the same CKException. That is a result, not a failed
+	     attempt: the value CloudKit rejects is not read through any door this
+	     dylib can reach.
+
+	     So v20 stops trying to make iCloud *work*. It makes iCloud
+	     *unavailable*, which is a state every app already ships UI for: the
+	     answer a device with no iCloud account gives. The entry points are
+	     replaced, the original is never called, and CloudKit's own
+	     dispatch_once is never entered - which is the part that matters,
+	     because an exception out of that block leaves the once gate owned by
+	     this thread for ever.
+
+	     CloudKitStubMode:
+	       noAccount  the substitute container answers
+	                  CKAccountStatusNoAccount and nil results (default)
+	       nil        every entry point answers nil. Only for a caller that
+	                  is known to handle nil - in Swift these are
+	                  non-optional, so nil there is a trap, not a fallback
+	       observe    do not replace anything; log only
+
+	     Set CloudKitStub to false to get the pre-v20 behaviour back exactly:
+	     the substitute is gone and CloudKit validates as it did before. -->
+	<key>CloudKitStub</key>
+	<true/>
+
+	<key>CloudKitStubMode</key>
+	<string>noAccount</string>
+
+	<key>CloudKitStubLogBudget</key>
+	<integer>12</integer>
+
+	<!-- ================== v20: the throw trampoline ==================
+
+	     objc_exception_throw is replaced in every image that has a slot for
+	     it. What the replacement can prove, it logs; what it cannot, it does
+	     not do.
+
+	     A swallow is only possible where the instruction after the throwing
+	     call is provably a return (ret / b / ldp x29,x30,[sp],#n; ret). There
+	     returning really does leave the throwing function and x0 becomes its
+	     result. Everywhere else the compiler emitted that call knowing it does
+	     not return, and resuming there would run bytes that were never code.
+
+	     ThrowSwallowAtSite was off in v20 through v22. It is ON from v23, and
+	     what that buys is bounded: it only fires where the continuation is a
+	     proven return AND the throwing image is in ThrowSwallowImages. The
+	     budget is per launch and every swallow is logged by name. -->
+	<!-- ==================== v23: the throw site the stack named ====================
+
+	     The v22 crash log answers the question v21 and v22 could only argue about:
+
+	         12  libobjc.A.dylib  objc_exception_throw + 448
+	         13  CloudKit         $sSo9CKPersonaC8CloudKitE6launchABSgvgZ + 592
+	         14  CloudKit         CKContainerEnvironmentString + 456
+	         ...
+	         21  CloudKit         CKMainBundleIsAppleExecutable + 60
+
+	     Two facts follow, and they are both structural rather than about values:
+
+	       * the throw comes out of a *Swift static property getter* inside a
+	         dispatch_once, not out of one of the Objective-C entry points the
+	         stub replaced. A getter is not a method in a method list, so
+	         CloudKitQuarantine - which sweeps method lists - can never contain
+	         it, whatever its prefixes are. That is why v23 adds
+	         GNCloudKitSymbolQuarantine.m: the surface is a symbol table.
+	       * exceptions out of a dispatch_once block are the reason v10 died with
+	         SIGABRT: libdispatch owns the once gate, the C++ unwinder cannot pass
+	         through it, and abort() is the fallback. So "make the throw not
+	         happen" and "swallow the throw" are the only two shapes left.
+
+	     This version ships both, each with the honest boundary stated:
+
+	       ThrowSwallowAtSite = true   swallow at proven-return sites (safe subset)
+	       ThrowSwallowForce  = false  (v23; true from v26) also swallow where
+	                                   the continuation is not
+	                                   provably a return. That is a gamble, not a
+	                                   fix: the throwing function resumes at the
+	                                   instruction after the call. Off in v23;
+	                                   the log tells you when this is the only
+	                                   option left on your device, and turning it
+	                                   on is one key.
+	       ThrowSwallowImages          only swallow when the throwing code lives
+	                                   in these images. Scope, not theatre: a
+	                                   forced swallow in an unrelated framework
+	                                   would invite a second crash into a launch
+	                                   that is already one variable deep.
+	       CloudKitSymbolQuarantine    CKPersona.launch -> nil,
+	                                   CKMainBundleIsAppleExecutable -> true.
+	                                   Works only for cross-image bindings, and
+	                                   the install log says per entry whether the
+	                                   symbol is exported at all. -->
+	<key>ThrowSwallowAtSite</key>
+	<true/>
+
+	<!-- v26: ON, by owner decision.
+
+	     v23 shipped this false and said so in the log at every throw site it
+	     refused. The v25 device log then answered the question that kept it
+	     false: the throw is at CloudKit's CKPersona.launch + 592, that call is a
+	     direct branch, zero slots hold the address, and the two symbols dlsym
+	     cannot see are the two that matter. There is no proven-return site left
+	     to earn a swallow at - the only remaining move is to resume the block
+	     and read what happens.
+
+	     What it does, stated plainly: objc_exception_throw returns to the
+	     instruction after the call, so CKPersona.launch continues with the value
+	     named by ThrowSwallowReturnNil. That block was emitted as unreachable by
+	     the compiler, so there are exactly two outcomes and the log cannot tell
+	     them apart before the fact:
+
+	       the block ends  -> the throw is gone, the launch continues
+	       it does not     -> SIGTRAP / SIGILL / SIGSEGV at the address in the
+	                          FORCED SWALLOW line, which is still the answer to
+	                          "where does this get resumed", and the next version
+	                          is built on that address
+
+	     One consequence worth knowing before reading the log: the throwing code
+	     is inside a dispatch_once. A swallow that returns makes the once gate
+	     complete with whatever value was returned, so CloudKit may then fail on
+	     its own nil persona rather than on an exception. Budget 4 bounds that to
+	     four swallows per launch; the fifth throw rethrows. -->
+	<key>ThrowSwallowForce</key>
+	<true/>
+
+	<!-- What a forced swallow leaves in x0.
+
+	     true  = nil. CKPersona.launch returns Optional<CKPersona>, where zero is
+	             `.none`. A nil takes the branch CloudKit already has for "no
+	             persona"; the exception object would pass a `guard let` and then
+	             be messaged as a persona, which is a later crash with a worse log.
+	     false = the v23 behaviour, the exception object, for comparison. -->
+	<key>ThrowSwallowReturnNil</key>
+	<true/>
+
+	<!-- Basename fragments. Empty array = no image filter (not recommended for a
+	     forced swallow). -->
+	<key>ThrowSwallowImages</key>
+	<array>
+		<string>CloudKit</string>
+	</array>
+
+	<key>ThrowSwallowBudget</key>
+	<integer>4</integer>
+
+	<key>ThrowTrampolineLogBudget</key>
+	<integer>16</integer>
+
+	<!-- ============== v20: the entitlement read surface ==============
+
+	     Fourteen public doors an entitlement can be read through, swept after
+	     launch (never during dyld init) and reported one line each: present or
+	     absent, and how many import slots hold its address. Counted, never
+	     rewritten - a rewrite for a symbol whose role is a guess is how a
+	     launch gets lost for a measurement nobody needed.
+
+	     This is the sweep that turns "SecCodeCopySigningInformation
+	     unreachable" into an answerable question: absent means it cannot be
+	     the reader; present with zero slots means every caller uses a direct
+	     branch or a resolution the dlsym tap already counts. -->
+	<key>EntitlementReadSurface</key>
+	<true/>
+
+	<key>CloudKitGuard</key>
+	<true/>
+
+	<!-- Which exception names may be swallowed. An allow list, not a substring:
+	     the reason text is reworded between OS versions, the name is stable.
+	     Empty this out and the guard refuses to install rather than silently
+	     becoming a suppressor of everything. -->
+	<key>CloudKitExceptionNames</key>
+	<array>
+		<string>CKException</string>
+		<string>NSCloudKitException</string>
+	</array>
+
+	<!-- Optional second filter on the reason. Empty = any reason, as long as the
+	     name matched. Narrow it (e.g. "malformed entitlements") if you ever want
+	     the guard to stop swallowing a later, different CloudKit failure. -->
+	<key>CloudKitExceptionReasonContains</key>
+	<array/>
+
+	<!-- Swallows are logged this many times, then only counted. A launch that
+	     touches iCloud on every document open would otherwise flood the log. -->
+	<key>CloudKitLogBudget</key>
+	<integer>8</integer>
+
+	<!-- Boundaries: @try/@catch around iCloud entry points, for the case where
+	     CloudKit used @throw and never reached -[NSException raise].
+	     Set false to keep only the -raise suppressor. -->
+	<key>CloudKitBoundariesEnabled</key>
+	<true/>
+
+	<!-- Only sites whose failure answer is documented and already handled by the
+	     caller belong here. Both entries below return "no container" / "not
+	     synchronised", which is what a properly re-signed app would have got.
+
+	     Deliberately NOT included, and here is why: +[CKContainer defaultContainer]
+	     and +[CKContainer containerWithIdentifier:] are non-optional in Swift, so
+	     answering nil converts a caught ObjC exception into a Swift trap. Add them
+	     only if the log shows the exception bypassed -[NSException raise] (that is:
+	     an "EXCEPTION name=CKException" line with no "cloudkit-guard: SWALLOWED"
+	     line after it), and expect the app to die in a different place:
+
+	         <dict>
+	             <key>Class</key><string>CKContainer</string>
+	             <key>Selector</key><string>defaultContainer</string>
+	             <key>ClassMethod</key><true/>
+	             <key>Arguments</key><integer>0</integer>
+	             <key>Return</key><string>object</string>
+	         </dict> -->
+	<key>CloudKitBoundaries</key>
+	<array>
+		<dict>
+			<key>Class</key>
+			<string>NSFileManager</string>
+			<key>Selector</key>
+			<string>URLForUbiquityContainerIdentifier:</string>
+			<key>ClassMethod</key>
+			<false/>
+			<key>Arguments</key>
+			<integer>1</integer>
+			<key>Return</key>
+			<string>object</string>
+		</dict>
+		<dict>
+			<key>Class</key>
+			<string>NSUbiquitousKeyValueStore</string>
+			<key>Selector</key>
+			<string>synchronize</string>
+			<key>ClassMethod</key>
+			<false/>
+			<key>Arguments</key>
+			<integer>0</integer>
+			<key>Return</key>
+			<string>bool</string>
+		</dict>
+	</array>
+
+	<!-- ===================== v15: entitlement type repair =====================
+
+	     v14 answered the malformed-entitlement CKException by swallowing it at
+	     -[NSException raise]. The next launch showed that CloudKit uses @throw:
+	     objc_exception_throw is called directly and -raise never runs, so the
+	     suppressor was never on the path.
+
+	     v15 prevents the exception instead of surviving it. CloudKit reads its
+	     own entitlements with SecTaskCopyValueForEntitlement, and the value it
+	     finds has the wrong type. dyld interposes that function for the whole
+	     process from src/GNEntitlementRepairInterpose.m, and the four iCloud
+	     keys are answered with the type Apple's schema requires:
+
+	         icloud-services                  array of strings  <- "*" is a string
+	         icloud-container-identifiers     array of strings
+	         ubiquity-container-identifiers   array of strings
+	         ubiquity-kvstore-identifier      string
+
+	     This is a type repair, not a grant: a value whose type is already
+	     correct is passed through untouched, and a key the signature does not
+	     carry is left absent. It cannot make iCloud work on a Distribution
+	     certificate - it stops a malformed value from being the reason the
+	     launch dies.
+
+	     On by default, like CloudKitGuard and for the same reason: the shipped
+	     default is the configuration the crash happens in, so a switch that
+	     defaults off would be dead code exactly where it is needed. -->
+	<key>EntitlementRepair</key>
+	<true/>
+
+
+
+	<!-- ========================= v18: the shape of the answer =========================
+
+	     v17's log proved the mechanism works and the *answer* was wrong:
+
+	         repair: #1 com.apple.developer.icloud-services: string "*" -> string "CloudKit"
+
+	     The rule asks for an array of strings. The repair built a bare string, so
+	     CloudKit was handed the same malformed type it had just refused - with a
+	     log line that looked like a success, a counter that moved, and a self-test
+	     that printed "interception is LIVE". Everything except the value was right.
+
+	     The decision now lives in src/GNRepairPolicy.h, which is pure C and is
+	     executed on the build host by scripts/repair_policy_test.c over every
+	     combination of inputs. The property it asserts is the one that was broken:
+	     a repair produces the kind the schema requires, or it produces nothing.
+
+	     Same version, three more doors onto the same value:
+
+	       SecCodeCopySigningInformation   the entitlements dictionary inside the
+	                                       signing information. The v17 log showed
+	                                       the singular SecTask call was not the only
+	                                       read on the path, so this public one is
+	                                       covered too.
+	       dlsym                           v17 measured 0 slots for the plural read
+	                                       in 2622 images while the singular had one.
+	                                       That is what a soft-linked symbol looks
+	                                       like - resolved once, cached, called
+	                                       through the cached value. Interposing the
+	                                       lookup catches it without a code page.
+	       objc_exception_throw            a tap, not a repair: name, reason and throw
+	                                       site for an exception thrown from the shared
+	                                       cache, where -[NSException raise] never runs.
+	-->
+
+	<!-- Answer the entitlement through dlsym() as well: any framework that resolves
+	     one of the three symbols at run time gets this dylib's repair instead of the
+	     real function. Everything else is passed through unchanged, and a symbol the
+	     process does not have is still reported as absent. -->
+	<key>DlsymTap</key>
+	<true/>
+
+	<key>DlsymTapLogBudget</key>
+	<integer>8</integer>
+
+	<!-- Record name / reason / userInfo and the throw site before calling the real
+	     objc_exception_throw. Behaviour is unchanged - the exception is re-thrown;
+	     what changes is that the next launch names it instead of leaving a bare
+	     EXC_CRASH. Off loses the diagnosis, not the fix, so it can be turned off
+	     if a launch feels slow. -->
+	<key>ThrowTap</key>
+	<true/>
+
+	<!-- Per key overrides for the value a repair answers with, for the case where
+	     the signature really does carry a container identifier this process should
+	     use. Empty by default: the built-in defaults are
+	       icloud-services                 "CloudKit"
+	       *-container-identifiers        iCloud.<bundle id>
+	       ubiquity-kvstore-identifier    <bundle id>
+	       icloud-container-environment   "Production"
+	     and they only ever replace a value whose type is wrong or that is the "*"
+	     placeholder - a well formed value from the signature is never overwritten.
+
+	     <key>com.apple.developer.icloud-container-identifiers</key>
+	     <string>iCloud.com.goodnotesapp.x</string>
+	-->
+	<key>EntitlementRepairValues</key>
+	<dict/>
+
+	<!-- ==================== v19: who asked the question ====================
+
+	     v18 ended the "is the hook armed" argument: the repair runs, the slots are
+	     rewritten, the self-test says LIVE. The launch still died with the same
+	     CKException. Those facts are only compatible one way - "the replacement
+	     runs" and "CloudKit went through the replacement" are different claims,
+	     and v18 had evidence for the first only.
+
+	     CallSiteAudit makes the second claim measurable. Every hit on one of the
+	     three repaired doors is recorded with the caller's return address, and the
+	     addresses are resolved to image + offset at +5s (never during dyld init).
+	     The next log therefore ends with one of three verdicts: nothing reached a
+	     door (the read is inside the shared cache by direct branch - stop hooking,
+	     fix the value where it is written), callers arrived and the value was
+	     already fine, or the value was rewritten and the process still refused it
+	     (and then the caller images say whether CloudKit was even among them). -->
+	<key>CallSiteAudit</key>
+	<true/>
+
+	<!-- Boundary behaviour for the entries in CloudKitBoundaries:
+	       swallow  return nil / NO after catching - the v14 behaviour, changes
+	                what the app sees
+	       observe  record class + selector + exception, then rethrow - identical
+	                behaviour, one log line
+	     Entries may override it with their own "Mode" key. The default stays
+	     swallow so the two v14 entries keep doing exactly what they did. -->
+	<key>BoundaryMode</key>
+	<string>swallow</string>
+
+	<!-- Wrap CloudKit's container / database entry points in *observe* mode.
+
+	     These are pure instrumentation: a wrapper that calls through, logs if it
+	     throws, and rethrows cannot alter the process. It answers the one question
+	     the v18 log left open - which call actually raises the CKException - and it
+	     is the reason not to guess further about SecCodeCopySigningInformation.
+
+	     They never swallow, on purpose. Those selectors return non-optional values
+	     in Swift, so returning nil converts a caught ObjC exception into a trap:
+	     the same crash with a worse log. Once the log names the culprit, one entry
+	     can be moved into CloudKitBoundaries with "Mode" = "swallow", for that one
+	     selector, deliberately. -->
+	<key>CloudKitBoundariesProbe</key>
+	<true/>
+
+	<!-- ====================== v17: the test, not the dylib ======================
+
+	     No key changed in v17 and no mechanism changed: the dylib is v16's. What
+	     changed is the host test the workflow runs before it builds anything.
+
+	     v16's real-image test asserted that a Mach-O object has at least five
+	     sections. That was true of the object it was written against - a zig clang
+	     object carrying a dozen __DWARF sections - and false on the runner, where
+	     the same fixture is compiled by Apple clang and carries __text and
+	     __compact_unwind: two. The walker was correct; the assertion was measuring
+	     the machine that wrote it.
+
+	     The test now reads the section table itself, with absolute offsets and none
+	     of the walker's structs, and compares the walker's counts against what the
+	     file declares. Two sections, twelve, or a future linked fixture all pass
+	     for the same reason. v12_lint holds the shape: real-fixture-reads-the-file
+	     and real-fixture-not-a-constant.
+	-->
+	<!-- ================= v16: reach the call site itself ================= -->
+
+	<!-- v15 interposed the two SecTask functions through __DATA,__interpose, which
+	     dyld applies to *bindings*. A caller that reaches the function with a
+	     direct branch has no binding, and an image dyld does not rebind for us has
+	     no slot to rewrite - so "armed" was still possible with nothing
+	     intercepted.
+
+	     v16 walks every image in the process (dyld shared cache included), finds
+	     the import slots for both functions by the address they already hold -
+	     the cache keeps no symbol table, which is why a name based rebinder finds
+	     nothing there - and rewrites them. On arm64e the existing slot content is
+	     reproduced byte for byte with the same key and discriminator before
+	     anything is written: a slot that cannot be reproduced is left exactly as
+	     it was, so the failure mode is a refusal and never a fault.
+
+	     Data pages only. No code page is written, so this is available on a
+	     Distribution signature - an entry patch or MSHookFunction is not (see
+	     AllowCodePatching). -->
+	<key>EntitlementSlotRebind</key>
+	<true/>
+
+	<!-- Call com.apple.developer.icloud-services twice at launch, once through
+	     dlsym (the real function) and once through this dylib's own binding, and
+	     log both answers. The entries differ only in whether an import binding is
+	     in the middle, so a difference proves the interception runs in this
+	     process; an identical pair proves it does not, and the log says so instead
+	     of leaving "armed" to be read as "working". -->
+	<key>EntitlementSlotSelfTest</key>
+	<true/>
+
+	<!-- Also repair an *empty* array, and a key that is absent entirely, using
+	     the value the signer should have written (iCloud.<bundle id>). Off by
+	     default: an empty array is a valid type and CloudKit did not complain
+	     about it in the v13 log, so filling it would be inventing data rather
+	     than fixing a type. Turn it on only if a later log names one of these
+	     keys as missing. -->
+	<key>EntitlementRepairFill</key>
+	<false/>
+
+	<!-- Rewrites are logged this many times, then only counted. The count is on
+	     the "repair(delayed)" line ~5s after launch. -->
+	<key>EntitlementRepairLogBudget</key>
+	<integer>6</integer>
+
+	<!-- ==================== run level / auto bisect ==================== -->
+
+	<!-- How much of the dylib is allowed to run:
+
+	       0  inert            log + diagnostics only, nothing installed
+	       1  data hooks       NSUserDefaults overrides
+	       2  + containers     app group / ubiquity fallbacks
+	       3  + interposition  keychain / SecCode / SecTask
+
+	     Start at 3. If the app dies before it finishes launching, the next
+	     launch automatically runs one level lower (AutoBisect) and keeps doing
+	     that until it starts, so a bad hook costs one crashed launch instead of
+	     a boot loop. The settled level is on screen (ShowLaunchNotice) and in
+	     Documents/gnunlock.bisect; delete that file to go back to 3. -->
+	<key>RunLevel</key>
+	<integer>0</integer>
+	<key>AutoBisect</key>
+	<false/>
+
+	<!-- v11: one variable per launch, inside the group the run level points at.
+
+	     Retrying the same build gives the same crash, and the run level only
+	     says "it is in the container fallbacks" - not *which* answer they should
+	     give. This ladder changes exactly one decision per launch:
+
+	         0  baseline (this plist)
+	         1  app group answers nil
+	         2  app group answers the app's own container
+	         3  app group hook removed
+	         4  keychain hook removed
+	         5  control: level 0, nothing of ours installed at all
+
+	     A step is abandoned when the launch before it never reached
+	     didFinishLaunching; the first step that survives is kept and the ladder
+	     stops. Five relaunches, no re-sign, no Mac, no plist editing.
+
+	     State: Documents/gnunlock.experiment. Delete that file to run it again.
+	     Step 5 is the important one: if the app still dies with nothing of ours
+	     installed, the crash is the re-sign or the app, not this dylib. -->
+	<key>ExperimentLadder</key>
+	<false/>
+
+	<!-- Put the settled level and the previous launch's exception on screen,
+	     once, ~2.5s after launch. This is how a launch crash gets diagnosed
+	     without pulling the container off the device. -->
+	<key>ShowLaunchNotice</key>
+	<false/>
+
+	<!-- Keep false. Writes are logged and skipped instead of applied. Turn it
+	     on only when you are chasing a specific entry and accept a crash. -->
+	<key>DryRun</key>
+	<false/>
+
+	<!-- Seconds after launch before the patch pipeline runs. Must stay > 0:
+	     doing this work during dyld init is what kills the app. -->
+	<key>Delay</key>
+	<real>2.0</real>
+
+	<key>Verbose</key>
+	<true/>
+
+	<!-- Dump __text bounds, the image table and every ObjC class to
+	     Documents/gnunlock-recon.txt -->
+	<key>Recon</key>
+	<false/>
+
+	<!-- Log the full loaded-image table (base/slide/path) at patch time -->
+	<key>LogImages</key>
+	<true/>
+
+	<!-- ================= launch forensics (GNGuard.m) ================= -->
+
+	<!-- Wrap -[UIApplicationDelegate application:(will|did)FinishLaunching
+	     WithOptions:] so an exception thrown during launch is caught, named and
+	     recorded instead of arriving as an anonymous SIGABRT with a stack full
+	     of bare offsets. Also rebinds abort()/exit() in app owned images, so a
+	     silent anti-tamper kill leaves a stack behind.
+
+	     This is the switch to turn OFF if you want the pure control run: with
+	     GuardEnabled false, a launch crash carries no extra information. -->
+	<key>GuardEnabled</key>
+	<false/>
+
+	<!-- true  - record the exception, then let the launch continue (the app
+	           may still come up, possibly with the subsystem that threw dead).
+	     false - record the exception, then rethrow, so the app dies exactly as
+	           it did before. Use this if swallowing leaves the app hanging:
+	           a dispatch_once block that threw stays entered, and the second
+	           caller can block forever. -->
+	<key>GuardSwallow</key>
+	<true/>
+
+	<key>GuardCatchWillFinish</key>
+	<true/>
+	<key>GuardCatchDidFinish</key>
+	<true/>
+
+	<!-- The net v9 and v10 did not have.
+	     Wrap -[UIApplication _handleDelegateCallbacksWithOptions:isSuspended:
+	     restoreState:], the frame directly under both launch callbacks.
+
+	     Why it is needed: v10 wrapped the *delegate's* two launch selectors and
+	     the next crash arrived with no frame of ours anywhere in the stack - so
+	     the wrapper was not on that path (delegate installed some other way, or
+	     the throw came out of a callback that was not one of the two). This one
+	     does not care who the delegate is or how it was set. -->
+	<key>GuardCatchBoundary</key>
+	<true/>
+
+	<!-- Last resort for naming an exception, and off unless needed.
+
+	     "auto"   - install only when none of the @try nets went in.
+	     "always" - install regardless.
+	     "never"  - never install.
+
+	     When it installs it rewrites the objc_exception_throw import slot in app
+	     owned images, records name / reason / userInfo and the throw site, then
+	     calls the real function, so behaviour is unchanged. This is the only
+	     capture that survives the path the last .ips showed, because there the
+	     uncaught handler was never reached (libc++abi went straight to
+	     std::terminate with a null current exception).
+
+	     It is also the only part of v11 that writes a data page during dyld
+	     init, which is why it is not on by default. -->
+	<key>GuardTraceThrow</key>
+	<string>auto</string>
+	<key>GuardTraceThrowBudget</key>
+	<integer>40</integer>
+
+	<!-- Copy the full report (exception + symbolicated stack + complete dyld
+	     image table) to the pasteboard. This is the only channel that reaches
+	     you without container access, a working app or a Mac: after the crash
+	     or the alert, paste it into the chat. -->
+	<key>GuardCopyToPasteboard</key>
+	<true/>
+
+	<!-- Record abort()/exit() called from app owned code, then call the real
+	     one. Data page writes only (import slots), never code.
+
+	     FALSE since v10, and it is no longer installed from the dylib
+	     constructor even when true. v9 ran this rebind inline during dyld
+	     initialisation, so a fault in the import-table walk killed the process
+	     before the log, the bisect ladder or the notice could say anything:
+	     that was the SIGBUS in _platform_strcmp.
+
+	     Turning it on now needs *both* keys (GuardTraceAbort and
+	     EnableGOTRebinding), and the install itself is deferred until
+	     GuardTraceAbortDelay seconds after launch. A diagnostic is not worth
+	     a launch. -->
+	<key>GuardTraceAbort</key>
+	<false/>
+	<key>GuardTraceAbortDelay</key>
+	<real>2.0</real>
+
+	<!-- ================== memory capability switches ================== -->
+
+	<!-- In-memory code patching. Both switches must be open, and the second
+	     one is not ours to open:
+
+	       1. AllowCodePatching = true        (this key, default false)
+	       2. the kernel reports CS_DEBUGGED  (get-task-allow in the code
+	          signature - i.e. a Development / debug-signed build)
+
+	     With a Distribution certificate check 2 always fails, so this stays
+	     false and nothing is written. Leave it false. -->
+	<key>AllowCodePatching</key>
+	<false/>
+
+	<!-- Data-only symbol interception: rewrite the app's own __got /
+	     __auth_got / __la_symbol_ptr slots instead of hooking the framework.
+	     This is what keeps the keychain / entitlement fixes working on a
+	     Distribution build without touching a code page.
+
+	     Off by default: the first build should boot with zero writes so you
+	     have a known-good baseline. Turn it on when you want the C level
+	     re-sign fixes, then check the log for "rebind ... slot(s)".
+	     See GNRebind.m before enabling.
+
+	     v10 note: this key now gates GNRebindSymbolInAppImages() itself, not
+	     just its callers. In v9 the launch guard bypassed it, which is how a
+	     feature documented as off managed to run in the constructor. -->
+	<key>EnableGOTRebinding</key>
+	<false/>
+
+	<!-- v11: a second, narrower gate, for the throw tracer only.
+
+	     GNInstallThrowTracer() rewrites one import slot - objc_exception_throw -
+	     to observe an exception and then call the real function. It changes no
+	     behaviour, so it must not require the switch that also turns on the
+	     keychain / SecCode / SecTask interposition (which does change behaviour).
+	     Keep the two decisions separate.
+
+	     Has no effect unless GuardTraceThrow asks for the tracer. -->
+	<key>AllowDiagnosticRebinding</key>
+	<false/>
+
+	<!-- Swift classes whose immediate-member block should be dumped -->
+	<key>ProbeClasses</key>
+	<array/>
+
+	<!-- ===================== re-sign crash fixes ===================== -->
+	<key>ResignFix</key>
+	<dict>
+		<key>Enabled</key>
+		<false/>
+
+		<!-- Strip kSecAttrAccessGroup from every keychain query. Without this
+		     a different team id means errSecMissingEntitlement (-34018) on
+		     every read, and apps that force-unwrap trap on launch.
+		     Needs EnableGOTRebinding (or a debug signature) to actually
+		     install; otherwise it logs and continues. -->
+		<key>StripKeychainAccessGroup</key>
+		<true/>
+		<key>LogKeychainCalls</key>
+		<true/>
+
+		<!-- App group containers do not exist after re-signing. What to answer
+		     instead: "docs" invents Documents/AppGroups/<group id>, "nil" hands
+		     back nil (what a genuinely non-entitled install gets), "home" hands
+		     back the app's own container.
+
+		     "docs" is what every re-sign tool does and what an app that force
+		     unwraps nil needs. But an app that trusts the URL and reads a
+		     container that is not there sees an *empty* store rather than a
+		     *missing* one - a different code path than the one it tests for.
+		     If the caught exception names a storage / library / migration
+		     subsystem, try "nil" next. Pure ObjC, always works. -->
+		<key>AppGroupFallback</key>
+		<false/>
+		<key>AppGroupFallbackMode</key>
+		<string>nil</string>
+
+		<!-- RETIRED in v8. -[NSUserDefaults initWithSuiteName:] is not swizzled
+		     any more: it is an init-family selector, so a plain C wrapper hands
+		     the caller a +0 object where ARC consumes +1, and the old body
+		     called init a second time on `self` after the first call had
+		     already returned nil. Neither hazard is worth what the hook bought
+		     (it fired almost never). Kept as a key so old configs still parse;
+		     the value is ignored and logged. -->
+		<key>SuiteNameFallback</key>
+		<false/>
+
+		<!-- iCloud container fallback. Off by default: turning this on makes
+		     the app think iCloud works when it does not. -->
+		<key>UbiquityFallback</key>
+		<false/>
+
+		<!-- Make -[NSBundle appStoreReceiptURL] return nil. Pure ObjC. -->
+		<key>DisableAppStoreReceipt</key>
+		<false/>
+
+		<!-- SecStaticCodeCheckValidity / SecCodeCheckValidity -> success.
+		     C level, needs EnableGOTRebinding. -->
+		<key>BypassCodeSignatureChecks</key>
+		<true/>
+
+		<!-- SecCodeCopySigningInformation -> identifier/teamid rewritten.
+		     C level, needs EnableGOTRebinding. -->
+		<key>ForceSigningInformation</key>
+		<true/>
+
+		<!-- SecTaskCopyValueForEntitlement -> synthesised values.
+		     C level, needs EnableGOTRebinding. -->
+		<key>ForceEntitlements</key>
+		<true/>
+
+		<!-- Fill these in with the values from the certificate you sign with.
+		     Leave TeamID empty to skip application-identifier synthesis. -->
+		<key>TeamID</key>
+		<string></string>
+		<key>BundleID</key>
+		<string>com.goodnotesapp.x</string>
+
+		<!-- Extra entitlements handed to anything that asks. Values may be
+		     string, boolean or array of strings. -->
+		<key>Entitlements</key>
+		<dict>
+			<key>get-task-allow</key>
+			<true/>
+			<key>beta-reports-active</key>
+			<true/>
+		</dict>
+	</dict>
+
+	<!-- ===================== data-only hooks ===================== -->
+	<key>Hooks</key>
+	<dict>
+		<key>Enabled</key>
+		<false/>
+
+		<!-- Interpose -[NSUserDefaults objectForKey:] and friends, so a key
+		     keeps returning our value even after the app writes its own.
+		     The app's preference names come from analysis/FINDINGS.md.
+
+		     The "mock_entitlements*" keys belong to the QA purchase service.
+		     Whether that service is assembled in a release build is unknown,
+		     so this is a cheap first attempt: it cannot crash and it costs
+		     nothing when the app does not read those keys. -->
+		<key>Defaults</key>
+		<dict>
+			<key>Enabled</key>
+			<true/>
+			<key>Overrides</key>
+			<array>
+				<dict>
+					<key>Key</key>
+					<string>mock_entitlements_enabled_key</string>
+					<key>Value</key>
+					<true/>
+				</dict>
+				<dict>
+					<key>Key</key>
+					<string>mock_entitlements_premium_state_key</string>
+					<key>Value</key>
+					<string>premium</string>
+				</dict>
+				<dict>
+					<key>Key</key>
+					<string>com.goodnotes.one_time_unlock_confirmed_by_purchase_service</string>
+					<key>Value</key>
+					<true/>
+				</dict>
+			</array>
+		</dict>
+
+		<!-- SyncedDefaults picks the iCloud key-value store from the process'
+		     application identifier. After a re-sign that identifier is not the
+		     one the app expects. The v2 anchor tried to force it by rewriting
+		     SecTaskCreateFromSelf - inside the shared cache, which is what
+		     killed the app. This is the same effect as one ObjC message.
+
+		     Leave Enabled false unless the log shows the app hanging or
+		     trapping during iCloud initialisation; the default path works
+		     fine now that nothing patches code. -->
+		<key>SYDIdentifier</key>
+		<dict>
+			<!-- Off in v8. It was a pass-through (Override empty), so it changed
+			     nothing, while its installer dlopen()ed a private framework from
+			     the dylib constructor - a load command during dyld init for zero
+			     benefit. Fill in Override and set Enabled true when you actually
+			     want to force the identifier. -->
+			<key>Enabled</key>
+			<false/>
+			<key>Override</key>
+			<string></string>
+		</dict>
+
+		<!-- Serve a response without a network, using NSURLProtocol (public API,
+		     no patching at all). Rules match on a substring of the URL, first
+		     match wins.
+
+		     Template - fill in the real endpoint and payload from a capture:
+
+		     <dict>
+		         <key>Match</key><string>/v1/entitlements</string>
+		         <key>Method</key><string>GET</string>
+		         <key>Status</key><integer>200</integer>
+		         <key>Body</key><string>{"currentPlans":{"base":{"planKey":"premium"}},
+		                                   "entitlements":{"pro_access":true,
+		                                                   "crossplatform_access":true}}</string>
+		     </dict> -->
+		<key>URLForge</key>
+		<dict>
+			<key>Enabled</key>
+			<false/>
+			<key>Rules</key>
+			<array/>
+		</dict>
+	</dict>
+
+	<!-- ===================== unlocking ===================== -->
+
+	<!-- Static offsets into executable memory. EMPTY ON PURPOSE.
+
+	     With a Distribution certificate these cannot be applied in memory.
+	     The equivalent, which does work, is to patch the Mach-O on disk
+	     before it is signed: unpack the IPA, let scripts/gnstatic.py apply the
+	     patches from a JSON file (it verifies the original bytes first), then
+	     sign the bundle again. LC Sign signs whatever is inside the IPA, so a
+	     patched bundle goes through exactly like an untouched one. See README
+	     "Unlocking with a Distribution certificate" for the exact command.
+
+	     If you ever build with a Development certificate, entries here work
+	     again - format:
+	     { "Image": "Goodnotes", "Offset": "0x231F1FC",
+	       "Bytes": "20008052C0035FD6", "Note": "..." } -->
+	<key>BytePatches</key>
+	<array/>
+
+	<!-- Find the code that references a C string, walk back to the function
+	     start, act there. EMPTY ON PURPOSE: on a Distribution build the write
+	     is refused, and a system image target is refused on any signature.
+
+	     Kept as the recon tool for finding the offset you then feed to
+	     gnstatic.py: set Action to "log" and read the static offset out of
+	     Documents/gnunlock.log.
+
+	     <dict>
+	       <key>String</key><string>missing_active_pro_entitlement</string>
+	       <key>Action</key><string>log</string>
+	       <key>Mode</key><string>function</string>
+	       <key>Occurrence</key><integer>0</integer>
+	       <key>MaxHits</key><integer>6</integer>
+	     </dict> -->
+	<key>Anchors</key>
+	<array/>
+
+	<!-- ObjC only, and data only - always safe. Behaviour:
+	       true  / one    -> return 1     (BOOL YES, non-nil)
+	       false / zero   -> return 0     (BOOL NO, nil)
+	       orig / skip    -> leave the method alone
+	     Both work at the ABI level whatever the declared return type is.
+
+	     Example (only if the class really exposes the selector - the Swift
+	     purchase stack has no @objc members, see analysis/FINDINGS.md):
+
+	     <dict>
+	       <key>Class</key><string>SomeClass</string>
+	       <key>Selector</key><string>isPro</string>
+	       <key>ClassMethod</key><false/>
+	       <key>Behavior</key><string>true</string>
+	     </dict> -->
+	<key>Swizzles</key>
+	<array/>
+
+	<key>BoolKeysTrue</key>
+	<array/>
+	<key>BoolKeysFalse</key>
+	<array/>
+	<key>DefaultsSet</key>
+	<dict/>
+</dict>
+</plist>

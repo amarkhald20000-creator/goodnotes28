@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ============================================================================
+  entitlements for Goodnotes (com.goodnotesapp.x) - the pair CloudKit wants
+  ============================================================================
+
+  This file exists because of one line in the v13/v17/v18 device logs:
+
+      Application has malformed entitlements. Found value "*" for entitlement
+      com.apple.developer.icloud-services, expected an array of strings
+
+  The value "*" is not a wildcard the system expands, and it is not something
+  CloudKit tolerates. It is a placeholder written by a signer that did not know
+  the real value. Every in-process repair in this repo is a way of answering that
+  question at run time; this file is the way of not having to.
+
+  ============================ how to use it ============================
+
+  LC Sign signs the bundle with an entitlements file you supply. Replace the
+  iCloud block in that file with the block below, keep everything else you
+  already sign with (application-identifier, get-task-allow,
+  keychain-access-groups, application-groups ...), then sign.
+
+  ============================ what to edit ============================
+
+  1. TEAMID  - your 10-character team identifier, twice, no "$(...)" left in.
+               LC Sign does not expand $(TeamIdentifierPrefix); a literal
+               "$(TeamIdentifierPrefix)" string in a signed entitlement is just
+               a wrong value with extra characters.
+
+  2. The container identifiers. iCloud.com.goodnotesapp.x is the container the
+     App Store build uses. If your provisioning profile grants a different one,
+     use the profile's - CloudKit resolves the container by name and a name the
+     profile does not grant fails the same way.
+
+  ============================ before you try it ============================
+
+  An entitlement the provisioning profile does not grant is not a warning: the
+  process is killed at launch by the entitlement check, which looks like a crash
+  at the same place with no exception and no log. So:
+
+    * if your profile has iCloud (a paid account with the iCloud capability),
+      this is the fix - one variable, and the audit lines in the dylib will show
+      the value is already correct because the signature carries it;
+
+    * if your profile has no iCloud, this file cannot help and neither can any
+      hook: the read happens inside the dyld shared cache, where the call is a
+      direct branch and no data-only mechanism can change its answer (see the
+      v19 section of README, and the "audit:" lines in the log). In that case the
+      goal changes from "make iCloud work" to "do not enter that path" - force
+      the app's own sync preference off with Hooks.Defaults.Overrides, which is
+      data-only and cannot fail.
+
+  Either way the value stops being "*". That is the only part of this that was
+  ever a type error.
+-->
+<plist version="1.0">
+<dict>
+
+	<!-- What CloudKit reads and rejects when it is a string. An array of the
+	     services this app may use. CloudKit is required; CloudDocuments is what
+	     the app's document sync uses. -->
+	<key>com.apple.developer.icloud-services</key>
+	<array>
+		<string>CloudKit</string>
+		<string>CloudDocuments</string>
+	</array>
+
+	<!-- The containers the signature is allowed to open. Empty here on purpose:
+	     fill in the identifier your profile grants, in both this array and the
+	     ubiquity array below. -->
+	<key>com.apple.developer.icloud-container-identifiers</key>
+	<array>
+		<string>iCloud.com.goodnotesapp.x</string>
+	</array>
+
+	<!-- Which container is the default one. CloudKit picks the first when this
+	     is absent; being explicit avoids a second class of "wrong container". -->
+	<key>com.apple.developer.icloud-container-environment</key>
+	<string>Production</string>
+
+	<!-- Key-value store. TEAMID must be replaced with the real team prefix. -->
+	<key>com.apple.developer.ubiquity-kvstore-identifier</key>
+	<string>TEAMID.com.goodnotesapp.x</string>
+
+	<!-- iCloud Drive / document containers. -->
+	<key>com.apple.developer.ubiquity-container-identifiers</key>
+	<array>
+		<string>iCloud.com.goodnotesapp.x</string>
+	</array>
+
+</dict>
+</plist>
